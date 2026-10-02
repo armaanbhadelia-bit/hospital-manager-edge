@@ -8,10 +8,14 @@ import hashlib
 
 st.set_page_config(page_title="Active Ward", page_icon="🏥")
 
+
+
 # INFOSEC BOUNCER
 if 'logged_in' not in st.session_state or not st.session_state['logged_in']:
     st.error("🚨 Unauthorized Access. Please log in first.")
     st.stop() 
+if 'patient_to_discharge' not in st.session_state:
+    st.session_state['patient_to_discharge'] = None
 
 # --- CRYPTO & DATA LOGIC ---
 if 'aes_key' not in st.session_state:
@@ -29,9 +33,11 @@ def encrypt_payload(vitals_dict):
     json_bytes = json.dumps(vitals_dict).encode('utf-8')
     return cipher_suite.encrypt(json_bytes)
 
+
 # --- DASHBOARD UI ---
 st.title("🏥 Active Ward Dashboard")
 st.success("Secure Connection Established")
+
 
 if 'active_patients' not in st.session_state:
     st.session_state['active_patients'] = {}
@@ -58,20 +64,30 @@ with col1:
 
 
 @st.dialog("🔐 Authorization Required")
-def secure_discharge_dialog(patient_name):
+def secure_discharge_dialog():
+    patient_name = st.session_state['patient_to_discharge']
     st.warning(f"You are requesting to terminate the telemetry stream for **{patient_name}**.")
-    password_attempt = st.text_input("Enter Admin Password to confirm", type="password")
     
-    if st.button("Authorize Discharge"):
-        # CRYPTOGRAPHY: Hash the input and check it against the known admin hash
-        correct_hash = hashlib.sha256("hospital123random_salt_8923".encode()).hexdigest()
-        calculated_hash = hashlib.sha256((password_attempt + "random_salt_8923").encode()).hexdigest()
-        
-        if calculated_hash == correct_hash:
-            del st.session_state['active_patients'][patient_name]
-            st.rerun() # This instantly closes the pop-up and updates the dashboard
-        else:
-            st.error("Invalid password. Security anomaly logged.")
+    # The unique key ensures the 2-second loop doesn't break your typing
+    password_attempt = st.text_input("Enter Admin Password to confirm", type="password", key="modal_pwd")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Authorize Discharge", key="modal_auth"):
+            st.toast("Authorization Attempt Logged")
+            correct_hash = hashlib.sha256("hospital123random_salt_8923".encode()).hexdigest()
+            calculated_hash = hashlib.sha256((password_attempt + "random_salt_8923").encode()).hexdigest()
+            
+            if calculated_hash == correct_hash:
+                del st.session_state['active_patients'][patient_name]
+                st.session_state['patient_to_discharge'] = None # Clear the memory flag
+                st.rerun() 
+            else:
+                st.error("Invalid password. Security anomaly logged.")
+    with col2:
+        if st.button("Cancel", key="modal_cancel"):
+            st.session_state['patient_to_discharge'] = None # Clear the flag to close
+            st.rerun()
 
 @st.fragment(run_every=2)
 def active_monitoring_panel():
@@ -95,7 +111,12 @@ def active_monitoring_panel():
             st.code(encrypted_data.decode('utf-8'), language="text")
             
             if st.button(f"Discharge {p_name}", key=f"del_{p_name}"):
-                secure_discharge_dialog(p_name)
+                st.session_state['patient_to_discharge'] = p_name
+                st.rerun()
+
+            # Place this at the VERY BOTTOM of the active_monitoring_panel function
+    if st.session_state['patient_to_discharge']:
+        secure_discharge_dialog()
 
 with col2:
     active_monitoring_panel()
