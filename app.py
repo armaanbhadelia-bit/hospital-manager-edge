@@ -1,19 +1,16 @@
-"""Streamlit hospital-centre dashboard. No login in this first rebuild."""
+"""Nurse-only Streamlit dashboard. Run with python -m streamlit run app.py."""
+import base64
 import html
-import random
-import time
-import uuid
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
-import pandas as pd
 import streamlit as st
+from client import APIError, call
 from config import api_token, api_url, master_key
-from gateway import send_reading
+from alert_rules import needs_ack
 
-st.set_page_config(page_title='PulseWard · Hospital Centre', page_icon='🏥', layout='wide')
+st.set_page_config(page_title='PulseWard · Hospital centre', page_icon='🏥', layout='wide')
 st.markdown('''<style>
-.block-container {padding-top:2rem; max-width:1500px;}
+.block-container {padding-top:4.5rem; max-width:1450px;}
 [data-testid="stSidebar"] {border-right:1px solid #dce6eb;}
 h1,h2,h3 {letter-spacing:-.035em;}
 .eyebrow {color:#0d9488;font-size:12px;font-weight:700;letter-spacing:2px;}
@@ -24,268 +21,413 @@ h1,h2,h3 {letter-spacing:-.035em;}
 .normal {color:#047857;background:#d1fae5;}
 .elevated {color:#92400e;background:#fef3c7;}
 .critical {color:#b91c1c;background:#fee2e2;}
-.waiting,.offline {color:#475569;background:#e2e8f0;}
+.waiting {color:#475569;background:#e2e8f0;}
 .vitals {display:flex;justify-content:space-between;gap:8px;margin-bottom:10px;}
 .vital-value {font-size:26px;font-weight:700;color:#16324a;}
 .vital-label {font-size:11px;color:#64748b;}
 </style>''', unsafe_allow_html=True)
 
-defaults = {'patients': {}, 'history': {}, 'latest': {}, 'alerts': [],
-            'monitoring': False, 'last_cycle': 0.0}
-for key, value in defaults.items():
-    if key not in st.session_state:
-        st.session_state[key] = value
+
+def timestamp(value):
+    return datetime.fromtimestamp(value, timezone.utc).strftime('%d %b · %H:%M:%S UTC') if value else '—'
 
 
-def add_patient(name, age, bed, scenario):
-    pid = 'P-' + uuid.uuid4().hex[:8].upper()
-    st.session_state.patients[pid] = dict(name=name, age=age, bed=bed, scenario=scenario)
-    st.session_state.history[pid] = []
+def clear_login(message=None):
+    st.session_state.clear()
+    if message:
+        st.session_state['flash'] = message
+    st.rerun()
 
 
-def sample(patient):
-    # Synthetic examples for exercising the pipeline, not physiological models.
-    shifted = patient['scenario'] == 'Shifted readings'
-    return {'heart_rate': round(random.uniform(150, 180) if shifted else random.uniform(65, 85), 1),
-            'oxygen_saturation': round(random.uniform(80, 88) if shifted else random.uniform(96, 99), 1),
-            'respiratory_rate': round(random.uniform(27, 35) if shifted else random.uniform(12, 18), 1),
-            'age': patient['age']}
-
-
-def exchange(item):
-    pid, vitals = item
-    measured_at = time.time()
+def api(action, data=None):
     try:
-        result = send_reading(pid, vitals, measured_at)
-        return pid, {'vitals': vitals, 'measured_at': measured_at, 'received_at': time.time(),
-                     'result': result, 'error': False}
-    except Exception:
-        # Do not show raw requests, tokens, or backend tracebacks in the UI.
-        return pid, {'vitals': vitals, 'measured_at': measured_at,
-                     'received_at': time.time(), 'result': None, 'error': True}
-
-
-def record(pid, entry):
-    previous = st.session_state.latest.get(pid, {}).get('result') or {}
-    st.session_state.latest[pid] = entry
-    history = st.session_state.history[pid]
-    history.append({'time': datetime.fromtimestamp(entry['measured_at'], timezone.utc),
-                    **entry['vitals']})
-    del history[:-120]
-    result = entry['result']
-    if result and result['status'] in {'ELEVATED', 'CRITICAL'} and previous.get('status') != result['status']:
-        st.session_state.alerts.insert(0, {'id': uuid.uuid4().hex, 'patient_id': pid,
-                                         'time': entry['received_at'], 'status': result['status'],
-                                         'acknowledged': False})
-        del st.session_state.alerts[100:]
-
-
-def displayed_status(entry):
-    if not entry:
-        return 'WAITING'
-    if entry['error']:
-        return 'OFFLINE'
-    if time.time() - entry['measured_at'] > 15:
-        return 'STALE'
-    return entry['result']['status']
-
-
-def clock(timestamp):
-    return datetime.fromtimestamp(timestamp, timezone.utc).strftime('%H:%M:%S UTC')
+        return call(action, data, st.session_state.get('session'))
+    except APIError as exc:
+        if exc.code == 401:
+            clear_login('Your session ended. Please log in again.')
+        st.error(str(exc))
+        return None
 
 
 try:
-    master_key()
-    api_token()
-    endpoint = api_url()
+    master_key(); api_token(); api_url()
 except RuntimeError as exc:
     st.title('Welcome to PulseWard')
     st.info(str(exc))
     st.code('python setup_local.py', language='bash')
     st.stop()
 
+if 'session' not in st.session_state:
+    st.markdown('<div class="eyebrow">PULSEWARD / HOSPITAL CENTRE</div>', unsafe_allow_html=True)
+    st.title('Your team. Your patients.')
+    st.caption('Doctors and approved nurses monitor their team. The owner has a separate read-only view.')
+    if 'flash' in st.session_state:
+        st.success(st.session_state.pop('flash'))
+    if st.session_state.pop('signup_done', False):
+        st.session_state['auth_view'] = 'Log in'
+    view = st.radio('Account', ['Log in', 'Create account'], horizontal=True, key='auth_view')
+    if view == 'Log in':
+        left, _ = st.columns([1, 1])
+        with left, st.form('login', clear_on_submit=True):
+            email = st.text_input('Email', max_chars=254)
+            password = st.text_input('Password', type='password', max_chars=128)
+            if st.form_submit_button('Log in', type='primary'):
+                try:
+                    result = call('login', {'email': email, 'password': password})
+                    st.session_state['session'] = result['session']
+                    st.session_state['profile'] = result['profile']
+                    st.rerun()
+                except APIError as exc:
+                    st.error(str(exc))
+    else:
+        signup_role = st.radio('Sign up as', ['Doctor', 'Nurse'], horizontal=True)
+        with st.form('signup'):
+            st.subheader('Create your ' + signup_role.lower() + ' account')
+            a, b = st.columns(2)
+            name = a.text_input('Full name', max_chars=80)
+            staff_id = b.text_input(signup_role + ' ID', max_chars=40, help='Letters, numbers, hyphens and underscores.')
+            doctor_id = st.text_input('Your doctor’s registered ID', max_chars=40) if signup_role == 'Nurse' else None
+            email = a.text_input('Email', max_chars=254)
+            phone = b.text_input('Phone number', max_chars=24)
+            photo = a.file_uploader('Profile photo', type=['png', 'jpg', 'jpeg'])
+            id_card = b.file_uploader('ID-card image', type=['png', 'jpg', 'jpeg'])
+            st.caption('PNG/JPEG, up to 2 MB each. The ID card is stored only; QR and identity verification are future features.')
+            password = a.text_input('Choose password', type='password', max_chars=128, help='At least 10 characters.')
+            confirm = b.text_input('Confirm password', type='password', max_chars=128)
+            if st.form_submit_button('Create account', type='primary'):
+                if password != confirm:
+                    st.error('The passwords do not match.')
+                elif len(password) < 10:
+                    st.error('Choose a password with at least 10 characters.')
+                elif photo is None or id_card is None:
+                    st.error('Upload both your profile photo and ID-card image.')
+                elif photo.size > 2_000_000 or id_card.size > 2_000_000:
+                    st.error('Each image must be under 2 MB.')
+                else:
+                    try:
+                        call('signup', {'role': signup_role.lower(), 'name': name, 'staff_id': staff_id,
+                                        'doctor_id': doctor_id, 'email': email,
+                                        'phone': phone, 'password': password,
+                                        'photo': base64.b64encode(photo.getvalue()).decode(),
+                                        'id_card': base64.b64encode(id_card.getvalue()).decode()})
+                        st.session_state['signup_done'] = True
+                        st.session_state['flash'] = ('Your account is ready. Log in with your email and password.' if signup_role == 'Doctor'
+                                                     else 'Account created. Log in to see your doctor-approval status.')
+                        st.rerun()
+                    except APIError as exc:
+                        st.error(str(exc))
+    st.stop()
+
+profile = st.session_state['profile']
+state = api('account_state')
+if state is None:
+    st.stop()
+profile.update(state)
+role = profile['role']
 with st.sidebar:
     st.markdown('## 🏥 PulseWard')
-    st.caption('HOSPITAL CENTRE · NURSE STATION')
+    if profile.get('photo'):
+        st.image(base64.b64decode(profile['photo']), width=80)
+    st.write(profile['name'])
+    st.caption(f"{role.title()} · {profile['staff_id']}")
+    st.caption(profile['email'])
     st.divider()
-    st.markdown('**Reading source**')
-    mode = st.radio('Choose a source', ['Simulator', 'Manual readings'], label_visibility='collapsed')
-    st.caption('Synthetic readings only. No IoMT device is connected yet.')
-    if mode == 'Simulator':
-        st.toggle('Run monitoring', key='monitoring')
-    else:
-        st.session_state.monitoring = False
-        st.caption('Use the manual reading form in Patient management.')
+    st.markdown('**Owner overview**' if role == 'admin' else '**Your doctor team**')
+    st.caption('Automatic simulated readings. Monitoring continues while the backend is running—even when this page is closed.')
     st.divider()
-    st.markdown('**Hospital-centre connection**')
-    st.caption('AES-256-GCM encrypted requests and responses')
-    st.caption('Polling every 3 seconds while this page is active.')
-    st.divider()
-    st.caption('Prototype · No staff login yet.\n\nPatients and readings belong to this browser session and reset when it ends.')
+    if st.button('Log out', width='stretch'):
+        try:
+            call('logout', session=st.session_state['session'])
+        except APIError:
+            pass
+        clear_login()
+    st.caption('Project prototype · fake patients · model-generated status labels')
 
 st.markdown('<div class="eyebrow">HOSPITAL CENTRE / LIVE OBSERVATION</div>', unsafe_allow_html=True)
-st.title('Patient monitoring')
-st.caption('One view of your ward. Follow readings, review model alerts, and keep patients in sight.')
-st.info('Project prototype: NORMAL / ELEVATED / CRITICAL are your existing model labels; they are not validated clinical decisions.')
+st.title('Hospital overview' if role == 'admin' else 'Our patients')
+st.caption('Read-only oversight · status only' if role == 'admin' else 'Live readings and shared alerts for your doctor’s team.')
+if 'flash' in st.session_state:
+    st.success(st.session_state.pop('flash'))
 
-monitor_tab, patients_tab, connection_tab = st.tabs(['Ward overview', 'Patient management', 'Connection & setup'])
+if role == 'nurse' and profile['approval_status'] != 'approved':
+    status = profile['approval_status']
+    if status == 'pending':
+        st.warning('Awaiting doctor approval. Patient access will open after approval.')
+        st.write('Requested doctor: ' + str(profile.get('doctor_name') or profile.get('doctor_staff_id') or 'Assigned doctor'))
+    else:
+        st.info('Choose your doctor to request team access.' if status == 'unassigned' else 'Your request was rejected. You may submit another request.')
+        if status == 'unassigned':
+            st.caption('Your earlier account and patient records are preserved. Approval assigns your previous patients to the doctor’s team.')
+        with st.form('request_team'):
+            doctor_id = st.text_input('Doctor’s registered ID')
+            if st.form_submit_button('Request team access', type='primary'):
+                if api('request_team', {'doctor_id': doctor_id}) is not None:
+                    st.session_state['profile'] = api('profile')
+                    st.rerun()
+    @st.fragment(run_every='3s')
+    def approval_watch():
+        latest = api('account_state')
+        if latest and latest['approval_status'] != status:
+            st.session_state['profile'] = api('profile')
+            st.rerun()
+        st.caption('Approval status updates automatically.')
+    approval_watch()
+    st.stop()
 
-with patients_tab:
+
+def render_events(owner=False):
+    st.subheader('Changes only')
+    st.caption('State changes are logged. Improvements do not request a new acknowledgement.')
+    before = st.session_state.get('events_before')
+    result = api('admin_events' if owner else 'events', {'before_id': before})
+    if result is None:
+        return
+    events = result['events']
+    names = {'DEVICE_CONNECTED': 'Sensor connected', 'DEVICE_DISCONNECTED': 'Sensor disconnected',
+             'ELEVATED': 'Changed to elevated', 'CRITICAL': 'Changed to critical',
+             'RETURNED_NORMAL': 'Returned to normal', 'INFERENCE_UNAVAILABLE': 'Model connection unavailable',
+             'INFERENCE_RESTORED': 'Model connection restored'}
+    rows = []
+    for e in events:
+        row = {'Time (UTC)': timestamp(e['occurred_at']), 'Patient': e['patient_name'], 'Bed': e['bed'],
+               'Event': names.get(e['kind'], e['kind']),
+               'Review': 'Acknowledged' if e['acknowledged_at'] else 'Pending' if needs_ack(e) else '—',
+               'Acknowledged by': ((e['acknowledged_by'] + ' · ' + e['acknowledged_by_id']) if e['acknowledged_by']
+                                   else 'Legacy record' if e['acknowledged_at'] else '—'),
+               'Acknowledged at': timestamp(e['acknowledged_at']),
+               'Patient record': 'Removed' if e['removed_at'] else 'Active'}
+        if owner:
+            row['Doctor'] = e['doctor_name'] or 'Unassigned'
+        rows.append(row)
+    if rows:
+        st.dataframe(rows, hide_index=True, width='stretch')
+    else:
+        st.info('No events yet.')
+    pending = {e['id']: f"{e['patient_name']} · {names.get(e['kind'])} · {timestamp(e['occurred_at'])}"
+               for e in events if needs_ack(e) and not e['acknowledged_at']}
+    if pending and not owner:
+        event_id = st.selectbox('Alert to acknowledge', list(pending), format_func=pending.get)
+        if st.button('Acknowledge alert'):
+            if api('acknowledge', {'event_id': event_id}) is not None:
+                st.rerun()
+    a, b = st.columns(2)
+    if a.button('Latest events', disabled=before is None):
+        st.session_state.pop('events_before', None); st.rerun()
+    if b.button('Older events', disabled=not result['has_more']):
+        st.session_state['events_before'] = events[-1]['id']; st.rerun()
+
+
+if role == 'admin':
+    st.info('Spectator access. This account cannot add/remove patients, approve nurses, or acknowledge alerts.')
+    owners, logs, approvals = st.tabs(['Staff & patients', 'Event log', 'Approval audit'])
+    with owners:
+        @st.fragment(run_every='3s')
+        def owner_overview():
+            data = api('admin_overview')
+            if data is None:
+                return
+            a, b, c = st.columns(3)
+            a.metric('Doctors', sum(s['role'] == 'doctor' for s in data['staff']))
+            b.metric('Nurses', sum(s['role'] == 'nurse' for s in data['staff']))
+            c.metric('Active patients', len(data['patients']))
+            st.subheader('Doctors and nurses')
+            staff_rows = [{'Name': s['name'], 'Staff ID': s['staff_id'], 'Role': s['role'].title(),
+                           'Email': s['email'], 'Doctor': s['doctor_name'] or '—',
+                           'Doctor ID': s['doctor_staff_id'] or '—', 'Approval': s['approval_status'].title()}
+                          for s in data['staff']]
+            st.dataframe(staff_rows, hide_index=True, width='stretch')
+            st.subheader('Patients · status only')
+            patient_rows = [{'Patient': p['name'], 'Patient ID': p['id'], 'Bed': p['bed'],
+                             'Doctor': p['doctor_name'] or 'Unassigned', 'Doctor ID': p['doctor_staff_id'] or '—',
+                             'Added by': p['added_by'], 'Status': p['status']} for p in data['patients']]
+            st.dataframe(patient_rows, hide_index=True, width='stretch')
+            st.caption('Updated · ' + timestamp(data['updated_at']))
+        owner_overview()
+    with logs:
+        @st.fragment(run_every='3s')
+        def owner_events():
+            render_events(owner=True)
+        owner_events()
+    with approvals:
+        @st.fragment(run_every='3s')
+        def owner_approvals():
+            before = st.session_state.get('audit_before')
+            result = api('admin_audit', {'before_id': before})
+            if result:
+                labels = {'TEAM_REQUESTED': 'Team requested', 'NURSE_APPROVED': 'Nurse approved', 'NURSE_REJECTED': 'Nurse rejected'}
+                rows = [{'Time (UTC)': timestamp(e['occurred_at']), 'Action': labels.get(e['action'], e['action']),
+                         'Nurse': e['nurse_name'], 'Nurse ID': e['nurse_id'],
+                         'Performed by': e['decision_by'], 'Staff ID': e['decision_by_id']} for e in result['audit']]
+                st.dataframe(rows, hide_index=True, width='stretch')
+                if st.button('Latest decisions', disabled=before is None):
+                    st.session_state.pop('audit_before', None); st.rerun()
+                if st.button('Older decisions', disabled=not result['has_more']):
+                    st.session_state['audit_before'] = result['audit'][-1]['id']; st.rerun()
+        owner_approvals()
+    st.stop()
+
+if role == 'doctor':
+    overview, manage, log, team_tab, account = st.tabs(['Live ward', 'Patient management', 'Event log', 'My nursing team', 'My profile'])
+else:
+    overview, manage, log, account = st.tabs(['Live ward', 'Patient management', 'Event log', 'My profile'])
+
+with overview:
+    @st.fragment(run_every='3s')
+    def live_ward():
+        snapshot = api('dashboard')
+        if snapshot is None:
+            st.warning('Live view unavailable. No previous readings are being presented as current.')
+            return
+        patients = snapshot['patients']
+        if role == 'doctor' and snapshot['pending_requests']:
+            st.warning(f"{snapshot['pending_requests']} nurse request(s) pending. Open My nursing team to review credentials.")
+        stats = st.columns(4)
+        stats[0].metric('Team patients', len(patients))
+        stats[1].metric('Normal · model', sum(p['status'] == 'NORMAL' for p in patients))
+        stats[2].metric('Needs review · model', sum(p['status'] in {'ELEVATED', 'CRITICAL'} for p in patients))
+        stats[3].metric('Unacknowledged alerts', snapshot['pending_alerts'])
+        st.caption('Automatic updates · ' + timestamp(snapshot['updated_at']))
+        if not patients:
+            st.info('Your ward is empty. Add a patient in Patient management; their readings start automatically.')
+            return
+        filter_by = st.selectbox('Show', ['All my patients', 'Needs review', 'Connection issues'])
+        visible = [p for p in patients if filter_by == 'All my patients'
+                   or (filter_by == 'Needs review' and p['status'] in {'ELEVATED', 'CRITICAL'})
+                   or (filter_by == 'Connection issues' and p['status'] not in {'NORMAL', 'ELEVATED', 'CRITICAL'})]
+        columns = st.columns(3)
+        for i, p in enumerate(visible):
+            status = p['status']
+            css = status.lower() if status in {'NORMAL', 'ELEVATED', 'CRITICAL'} else 'waiting'
+            with columns[i % 3].container(border=True):
+                st.markdown(f'<div class="patient-top"><div class="patient-name">{html.escape(p["name"])}</div>'
+                            f'<span class="badge {css}">{status}</span></div>'
+                            f'<div class="patient-sub">Bed {html.escape(p["bed"])} · Age {p["age"]} · {p["id"]}</div>', unsafe_allow_html=True)
+                if p['vitals']:
+                    v = p['vitals']
+                    st.markdown('<div class="vitals">' + ''.join(
+                        f'<div><div class="vital-value">{v[key]:g}</div><div class="vital-label">{label}</div></div>'
+                        for key, label in [('heart_rate', 'HEART RATE · bpm'), ('oxygen_saturation', 'SpO₂ · %'),
+                                           ('respiratory_rate', 'RESP · /min')]) + '</div>', unsafe_allow_html=True)
+                    st.caption('Last sample · ' + timestamp(p['measured_at']))
+                else:
+                    descriptions = {'DISCONNECTED': 'The simulated sensor is unplugged.',
+                                    'WAITING': 'Waiting for the next automatic reading…',
+                                    'OFFLINE': 'The model service did not return a valid result.',
+                                    'STALE': 'No fresh result. Check the backend connection.'}
+                    st.caption(descriptions.get(status, status))
+                with st.expander('Simulated sensor'):
+                    st.caption('Use this to demonstrate a sensor being unplugged or reconnected.')
+                    label = 'Disconnect sensor' if p['connected'] else 'Reconnect sensor'
+                    if st.button(label, key='device_' + p['id']):
+                        if api('device', {'patient_id': p['id'], 'connected': not bool(p['connected'])}) is not None:
+                            st.rerun()
+        if not visible:
+            st.info('No patients match this filter.')
+    live_ward()
+
+with manage:
     st.subheader('Add a patient')
+    st.caption('The patient is assigned to your doctor’s team. Their fake sensor starts automatically. Adult simulation: ages 18–100.')
     with st.form('add_patient', clear_on_submit=True):
         a, b, c = st.columns([2, 1, 1])
-        name = a.text_input('Patient label', placeholder='Use a fictional name or demo ID', max_chars=60)
-        age = b.number_input('Age (years)', min_value=0, max_value=130, value=35)
-        bed = c.text_input('Bed / room', placeholder='A-01', max_chars=20)
-        scenario = st.selectbox('Simulator scenario', ['Typical readings', 'Shifted readings'])
-        submitted = st.form_submit_button('Add patient', type='primary')
-        if submitted:
-            if not name.strip() or not bed.strip():
-                st.error('Enter a patient label and bed / room.')
-            elif len(st.session_state.patients) >= 12:
-                st.error('This demo supports up to 12 patients per session.')
-            elif any(p['bed'].casefold() == bed.strip().casefold() for p in st.session_state.patients.values()):
-                st.error('That bed is already assigned.')
-            else:
-                add_patient(name.strip(), int(age), bed.strip(), scenario)
+        name = a.text_input('Patient name / label', max_chars=80)
+        age = b.number_input('Age', min_value=18, max_value=100, value=35)
+        bed = c.text_input('Bed / room', max_chars=20)
+        confirmation = st.text_input('Your password to add this patient', type='password', max_chars=128)
+        if st.form_submit_button('Add patient', type='primary'):
+            if api('add_patient', {'name': name, 'age': int(age), 'bed': bed, 'password': confirmation}) is not None:
+                st.session_state['flash'] = 'Patient added. Automatic readings will appear in Live ward.'
                 st.rerun()
-    if st.session_state.patients:
-        labels = {pid: f"{p['bed']} · {p['name']} · {pid}" for pid, p in st.session_state.patients.items()}
-        st.subheader('Manage an existing patient')
-        selected = st.selectbox('Patient', list(labels), format_func=labels.get)
-        patient = st.session_state.patients[selected]
-        new_scenario = st.selectbox('Change simulator scenario', ['Typical readings', 'Shifted readings'],
-                                    index=int(patient['scenario'] == 'Shifted readings'), key=f'scenario_{selected}')
-        if new_scenario != patient['scenario']:
-            patient['scenario'] = new_scenario
-            st.rerun()
-        if mode == 'Manual readings':
-            with st.form('manual_reading'):
-                x, y, z = st.columns(3)
-                hr = x.number_input('Heart rate · bpm', 0.0, 350.0, 72.0)
-                spo2 = y.number_input('SpO₂ · %', 0.0, 100.0, 98.0)
-                resp = z.number_input('Respiratory rate · /min', 0.0, 150.0, 15.0)
-                if st.form_submit_button('Encrypt and analyse', type='primary'):
-                    with st.spinner('Waiting for the encrypted result…'):
-                        pid, entry = exchange((selected, {'heart_rate': hr, 'oxygen_saturation': spo2,
-                                                          'respiratory_rate': resp, 'age': patient['age']}))
-                    record(pid, entry)
-                    if entry['error']:
-                        st.error('No result received. Check that FastAPI is running and both sides use the same configuration.')
-                    else:
-                        st.success(f"Model result: {entry['result']['status']}")
-        with st.expander('Remove patient'):
-            confirmed = st.checkbox('Remove this patient and their session history', key=f'remove_confirm_{selected}')
-            if st.button('Remove patient', disabled=not confirmed):
-                for collection in ['patients', 'history', 'latest']:
-                    st.session_state[collection].pop(selected, None)
-                st.session_state.alerts = [a for a in st.session_state.alerts if a['patient_id'] != selected]
-                st.rerun()
-
-with connection_tab:
-    st.subheader('Your encrypted round trip')
-    st.markdown('1. Hospital centre collects a reading.\n2. The gateway encrypts it.\n'
-                '3. FastAPI authenticates and decrypts it, then runs your LSTM.\n'
-                '4. FastAPI encrypts the result.\n5. The centre decrypts and displays it.')
-    st.code(endpoint, language=None)
-    st.caption('The encryption boundary starts at the Streamlit server / hospital-centre gateway. '
-               'The browser and any future IoMT-to-centre connection need their own protected transport.')
-    st.markdown('**Start the inference service in a separate terminal**')
-    st.code('python -m uvicorn server:app --host 127.0.0.1 --port 8000', language='bash')
-    st.caption('Configuration: .env. Never publish that file. The README explains remote connections and limitations.')
-
-with monitor_tab:
-    if not st.session_state.patients:
-        st.subheader('Your ward is ready')
-        st.write('Add your first patient in Patient management, or load three fictional patients to explore the dashboard.')
-        if st.button('Load demo ward', type='primary'):
-            for args in [('Demo patient 01', 30, 'A-01', 'Typical readings'),
-                         ('Demo patient 02', 55, 'A-02', 'Typical readings'),
-                         ('Demo patient 03', 78, 'A-03', 'Shifted readings')]:
-                add_patient(*args)
-            st.rerun()
+    if role == 'doctor':
+        st.divider()
+        st.subheader('Remove a patient')
+        current = api('dashboard')
+        if current and current['patients']:
+            labels = {p['id']: f"{p['bed']} · {p['name']}" for p in current['patients']}
+            with st.form('remove_patient', clear_on_submit=True):
+                pid = st.selectbox('Patient to remove', list(labels), format_func=labels.get)
+                password = st.text_input('Your password to remove this patient', type='password', max_chars=128)
+                agreed = st.checkbox('Remove from active monitoring and stop their simulated readings')
+                st.caption('Past change events remain in your event log. Raw reading history is never stored.')
+                if st.form_submit_button('Remove patient'):
+                    if not agreed:
+                        st.error('Confirm removal using the checkbox.')
+                    elif api('remove_patient', {'patient_id': pid, 'password': password}) is not None:
+                        st.session_state['flash'] = 'Patient removed from active monitoring.'
+                        st.rerun()
+        else:
+            st.caption('No active patients to remove.')
     else:
+        st.caption('Only your doctor can remove a patient. You can add patients and monitor the team here.')
+
+with log:
+    @st.fragment(run_every='3s')
+    def event_log():
+        render_events()
+    event_log()
+
+if role == 'doctor':
+    with team_tab:
         @st.fragment(run_every='3s')
-        def ward():
-            now = time.time()
-            if mode == 'Simulator' and st.session_state.monitoring and now - st.session_state.last_cycle >= 2.8:
-                st.session_state.last_cycle = now
-                work = [(pid, sample(p)) for pid, p in st.session_state.patients.items()]
-                with ThreadPoolExecutor(max_workers=4) as pool:
-                    for pid, entry in pool.map(exchange, work):
-                        record(pid, entry)
-            statuses = {pid: displayed_status(st.session_state.latest.get(pid)) for pid in st.session_state.patients}
-            metrics = st.columns(4)
-            metrics[0].metric('Patients in ward', len(statuses))
-            metrics[1].metric('Normal · model', sum(s == 'NORMAL' for s in statuses.values()))
-            metrics[2].metric('Needs review · model', sum(s in {'ELEVATED', 'CRITICAL'} for s in statuses.values()))
-            metrics[3].metric('Awaiting fresh result', sum(s in {'WAITING', 'OFFLINE', 'STALE'} for s in statuses.values()))
-            if mode == 'Simulator' and not st.session_state.monitoring:
-                st.warning('Monitoring paused. Turn on Run monitoring in the sidebar to send simulated readings.')
-            if any(s == 'OFFLINE' for s in statuses.values()):
-                st.error('Some readings have no result. Check FastAPI and the shared configuration; previous results are not shown as current.')
-            st.caption('Latest model results · readings older than 15 seconds are marked STALE')
-            status_filter = st.selectbox('Show patients', ['All patients', 'Needs review', 'Awaiting fresh result'])
-            visible = [(pid, p) for pid, p in st.session_state.patients.items()
-                       if status_filter == 'All patients'
-                       or (status_filter == 'Needs review' and statuses[pid] in {'ELEVATED', 'CRITICAL'})
-                       or (status_filter == 'Awaiting fresh result' and statuses[pid] in {'WAITING', 'OFFLINE', 'STALE'})]
-            columns = st.columns(3)
-            for i, (pid, p) in enumerate(visible):
-                entry = st.session_state.latest.get(pid)
-                status = statuses[pid]
-                style = status.lower() if status in {'NORMAL', 'ELEVATED', 'CRITICAL'} else 'waiting'
-                with columns[i % 3].container(border=True):
-                    st.markdown(f'<div class="patient-top"><div class="patient-name">{html.escape(p["name"])}</div>'
-                                f'<span class="badge {style}">{status}</span></div>'
-                                f'<div class="patient-sub">Bed {html.escape(p["bed"])} · Age {p["age"]} · {pid}</div>',
-                                unsafe_allow_html=True)
-                    if entry:
-                        v = entry['vitals']
-                        st.markdown('<div class="vitals">' + ''.join(
-                            f'<div><div class="vital-value">{v[key]:g}</div><div class="vital-label">{label}</div></div>'
-                            for key, label in [('heart_rate', 'HEART RATE · bpm'), ('oxygen_saturation', 'SpO₂ · %'),
-                                               ('respiratory_rate', 'RESP · /min')]) + '</div>', unsafe_allow_html=True)
-                        st.caption(f"Last sample · {clock(entry['measured_at'])}")
-                        if entry['result']:
-                            st.caption(f"Last model score · {entry['result']['mse_loss']:.5f}")
-                    else:
-                        st.caption('Waiting for the first reading…')
-            if not visible:
-                st.info('No patients match this filter.')
-            st.divider()
-            chart_col, alerts_col = st.columns([1.7, 1])
-            with chart_col:
-                st.subheader('Reading history')
-                ids = list(st.session_state.patients)
-                chart_labels = {pid: st.session_state.patients[pid]['name'] for pid in ids}
-                selected_chart = st.selectbox('Inspect a patient', ids, format_func=chart_labels.get)
-                rows = st.session_state.history[selected_chart]
-                if rows:
-                    df = pd.DataFrame(rows).set_index('time')
-                    feature = st.selectbox('Measurement', ['heart_rate', 'oxygen_saturation', 'respiratory_rate'],
-                                          format_func={'heart_rate': 'Heart rate · bpm', 'oxygen_saturation': 'SpO₂ · %',
-                                                       'respiratory_rate': 'Respiratory rate · /min'}.get)
-                    st.line_chart(df[[feature]], color='#0D9488', height=240)
-                    st.caption('Last 120 input readings · UTC. A plotted reading may still have failed inference.')
-                else:
-                    st.info('History will appear after the first reading.')
-            with alerts_col:
-                st.subheader('Model alert log')
-                if not st.session_state.alerts:
-                    st.caption('No model alerts recorded yet.')
-                for alert in st.session_state.alerts[:10]:
-                    p = st.session_state.patients.get(alert['patient_id'])
-                    if not p:
-                        continue
-                    with st.container(border=True):
-                        st.write(f"{alert['status']} · {p['name']}")
-                        st.caption(clock(alert['time']))
-                        if alert['acknowledged']:
-                            st.caption('✓ Acknowledged · does not change patient status')
-                        elif st.button('Acknowledge', key=alert['id']):
-                            alert['acknowledged'] = True
-                            st.rerun()
-                if len(st.session_state.alerts) > 10:
-                    st.caption(f'Showing the latest 10 of {len(st.session_state.alerts)} session alerts.')
-        ward()
+        def nursing_team():
+            data = api('team')
+            if data is None:
+                return
+            pending = [n for n in data['nurses'] if n['approval_status'] == 'pending']
+            st.subheader('Nursing team')
+            st.caption('Your doctor ID: ' + profile['staff_id'] + ' · Give this ID to nurses who request to join.')
+            if pending:
+                st.warning(f'{len(pending)} nurse request(s) awaiting your decision.')
+                choices = {n['account_id']: n['name'] + ' · ' + n['staff_id'] for n in pending}
+                selected = st.selectbox('Pending nurse request', list(choices), format_func=choices.get)
+                if st.button('Review credentials'):
+                    st.session_state['review_nurse_id'] = selected
+                review_id = st.session_state.get('review_nurse_id')
+                if review_id in choices:
+                    credentials = api('nurse_request', {'account_id': review_id})
+                    if credentials:
+                        with st.container(border=True):
+                            st.subheader(credentials['name'])
+                            st.write('Nurse ID: ' + credentials['staff_id'])
+                            st.write('Email: ' + credentials['email'])
+                            st.write('Phone: ' + credentials['phone'])
+                            left, right = st.columns(2)
+                            left.image(base64.b64decode(credentials['photo']), caption='Profile photo', width=180)
+                            right.image(base64.b64decode(credentials['id_card']), caption='Uploaded ID card', width=400)
+                            st.caption('Review these uploaded details yourself. There is no automatic ID, QR or face verification.')
+                            approve, reject = st.columns(2)
+                            decision = None
+                            if approve.button('Approve nurse', type='primary'):
+                                decision = 'approve'
+                            if reject.button('Reject nurse'):
+                                decision = 'reject'
+                            if decision:
+                                result = api('review_nurse', {'account_id': review_id, 'decision': decision})
+                                if result is not None:
+                                    st.session_state.pop('review_nurse_id', None)
+                                    st.session_state['flash'] = 'Nurse approved.' if decision == 'approve' else 'Nurse request rejected.'
+                                    st.rerun()
+            else:
+                st.success('No pending nurse requests.')
+            if data['nurses']:
+                rows = [{'Name': n['name'], 'Nurse ID': n['staff_id'], 'Email': n['email'], 'Phone': n['phone'],
+                         'Approval': n['approval_status'].title(), 'Reviewed at': timestamp(n['reviewed_at'])}
+                        for n in data['nurses']]
+                st.dataframe(rows, hide_index=True, width='stretch')
+            else:
+                st.info('No nurses have requested to join yet.')
+        nursing_team()
+
+with account:
+    st.subheader('My staff profile')
+    a, b = st.columns([1, 3])
+    a.image(base64.b64decode(profile['photo']), width=150)
+    b.write('**' + profile['name'].replace('*', '') + '**')
+    b.write(role.title() + ' ID: ' + profile['staff_id'])
+    b.write('Email: ' + profile['email'])
+    b.write('Phone: ' + profile['phone'])
+    st.caption('Your ID-card image is stored for future project features. It is not used for verification or login.')
+    if st.button('View my saved ID card'):
+        result = api('profile')
+        if result:
+            st.image(base64.b64decode(result['id_card']), width=500)

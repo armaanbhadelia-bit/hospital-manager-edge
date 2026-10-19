@@ -1,4 +1,3 @@
-"""Authenticated payload encryption with separate request/response keys."""
 import base64
 import json
 import os
@@ -7,42 +6,46 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-MAX_AGE_SECONDS = 120
+DOMAINS = {'request', 'response', 'centre_request', 'centre_response', 'profile'}
 
 
-def cipher(key, direction):
-    if direction not in {'request', 'response'}:
-        raise ValueError('Invalid direction')
+def cipher(key, domain):
+    if domain not in DOMAINS:
+        raise ValueError('Invalid encryption domain')
     derived = HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
-                   info=f'hospital-monitor-v1/{direction}'.encode()).derive(key)
+                   info=f'pulseward-v2/{domain}'.encode()).derive(key)
     return AESGCM(derived)
 
 
-def encrypt(payload, key, direction):
+def encrypt(payload, key, domain):
     nonce = os.urandom(12)
-    aad = f'hospital-monitor-v1/{direction}'.encode()
-    data = json.dumps(payload, allow_nan=False, separators=(',', ':')).encode()
-    encrypted = cipher(key, direction).encrypt(nonce, data, aad)
-    return {'nonce': base64.b64encode(nonce).decode(),
-            'ciphertext': base64.b64encode(encrypted).decode()}
+    raw = json.dumps(payload, allow_nan=False, separators=(',', ':')).encode()
+    data = cipher(key, domain).encrypt(nonce, raw, domain.encode())
+    return {'nonce': base64.b64encode(nonce).decode(), 'ciphertext': base64.b64encode(data).decode()}
 
 
-def decrypt(envelope, key, direction):
+def decrypt(envelope, key, domain):
     nonce = base64.b64decode(envelope['nonce'], validate=True)
-    ciphertext = base64.b64decode(envelope['ciphertext'], validate=True)
-    if len(nonce) != 12 or len(ciphertext) > 16384:
-        raise ValueError('Invalid encrypted message')
-    aad = f'hospital-monitor-v1/{direction}'.encode()
-    data = cipher(key, direction).decrypt(nonce, ciphertext, aad)
-    result = json.loads(data)
-    if not isinstance(result, dict):
+    data = base64.b64decode(envelope['ciphertext'], validate=True)
+    if len(nonce) != 12 or len(data) > 8_000_000:
+        raise ValueError('Invalid encrypted packet')
+    value = json.loads(cipher(key, domain).decrypt(nonce, data, domain.encode()))
+    if not isinstance(value, dict):
         raise ValueError('Expected an object')
-    return result
+    return value
 
 
 def check_fresh(timestamp):
     if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
         raise ValueError('Invalid timestamp')
-    # NaN and infinity also fail this bounded comparison.
-    if not -10 <= time.time() - timestamp <= MAX_AGE_SECONDS:
-        raise ValueError('Expired message or clock mismatch')
+    if not -10 <= time.time() - timestamp <= 120:
+        raise ValueError('Expired packet or clock mismatch')
+
+
+def seal_image(raw, key, owner, kind):
+    nonce = os.urandom(12)
+    return nonce + cipher(key, 'profile').encrypt(nonce, raw, f'{owner}/{kind}'.encode())
+
+
+def open_image(blob, key, owner, kind):
+    return cipher(key, 'profile').decrypt(blob[:12], blob[12:], f'{owner}/{kind}'.encode())

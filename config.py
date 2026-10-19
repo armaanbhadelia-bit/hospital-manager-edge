@@ -15,13 +15,13 @@ def master_key():
             raise ValueError()
         return key
     except (KeyError, ValueError) as exc:
-        raise RuntimeError('Run python setup_local.py to configure a 32-byte key.') from exc
+        raise RuntimeError('Run python setup_local.py before starting the app.') from exc
 
 
 def api_token():
     token = os.getenv('HOSPITAL_API_TOKEN', '')
     if len(token) < 32:
-        raise RuntimeError('Run python setup_local.py to configure the API token.')
+        raise RuntimeError('Run python setup_local.py before starting the app.')
     return token
 
 
@@ -30,7 +30,13 @@ def api_url():
     parsed = urlsplit(url)
     local = parsed.hostname in {'127.0.0.1', 'localhost', '::1'}
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise RuntimeError('Use a plain API base URL without credentials or a query.')
+        raise RuntimeError('Use a base API URL without credentials or query parameters.')
     if not parsed.hostname or (parsed.scheme != 'https' and not (local and parsed.scheme == 'http')):
-        raise RuntimeError('Remote API connections require HTTPS.')
+        raise RuntimeError('Remote connections require HTTPS.')
     return url
+
+
+def data_dir():
+    path = Path(os.getenv('HOSPITAL_DATA_DIR', str(ROOT / 'data'))).resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
